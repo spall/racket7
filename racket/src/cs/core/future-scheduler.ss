@@ -111,8 +111,9 @@
 	(lambda (new-eng)
 	  (lock-acquire (worker-lock worker))
 	  (future*-engine-set! future new-eng)
-	  (queue-add! (worker-work-queue worker) future)
-	  (condition-signal (worker-cond worker)) ;; in case worker went to sleep.
+	  (unless (future*-blocked? future) ;; when not blocked. reschedule.
+		  (queue-add! (worker-work-queue worker) future)
+		  (condition-signal (worker-cond worker))) ;; in case worker went to sleep.
 	  (lock-release (worker-lock worker))))
       
       ;; need to have lock here.
