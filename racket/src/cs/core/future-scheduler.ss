@@ -96,7 +96,8 @@
 	  (lock-release (worker-lock worker))
 	  (cond
 	   [(steal-work worker)  
-	    (do-work)]
+	    (do-work)
+	    (loop)]
 	   [else  
 	    (wait-for-work worker) ;; doesn't seem to use cpu!
 	    (loop)])]
@@ -109,18 +110,35 @@
       
       (define (expire future worker)
 	(lambda (new-eng)
-	  (lock-acquire (worker-lock worker))
 	  (future*-engine-set! future new-eng)
-	  (queue-add! (worker-work-queue worker) future)
-	  (condition-signal (worker-cond worker)) ;; in case worker went to sleep.
-	  (lock-release (worker-lock worker))))
+	  (cond
+	   [(future*-resumed? future) ;; run to completion
+	    ((future*-engine future) 100 void complete (expire future worker))]
+	   [(not (future*-cont future)) ;; don't want to reschedule future with a saved continuation
+	    (lock-acquire (worker-lock worker))
+	    (queue-add! (worker-work-queue worker) future)
+	    (lock-release (worker-lock worker))])))
+
+      (define (prefix f)
+	(lambda ()
+	  (when (future*-blocked? f)
+		(call-with-composable-continuation
+		 (lambda (k)		   
+		   (lock-acquire (future*-lock f))
+		   (future*-cont-set! f k)
+		   (lock-release (future*-lock f)))
+		 (future*-prompt f))
+		(when (future*-blocked? f) ;; so engine doesn't run more than once.
+		      (condition-signal (future*-cond f)) ;; wake up touch thread (if there is one)
+		      (engine-block)))))
+
       
       ;; need to have lock here.
       (define (do-work)
 	(let ([work (queue-remove! (worker-work-queue worker))])
 	  (current-future work)
 	  (lock-release (worker-lock worker)) ;; release lock
-	  ((future*-engine work) 100 void complete (expire work worker)) ;; call engine.
+	  ((future*-engine work) 100000 (prefix work) complete (expire work worker)) ;; call engine.
 	  (current-future #f)))
       
       (loop)))

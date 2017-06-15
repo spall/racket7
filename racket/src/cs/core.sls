@@ -668,4 +668,10 @@
   (set-impersonator-hash!)
   (set-procedure-impersonator-hash!)
   (set-vector-impersonator-hash!)
-  (set-box-impersonator-hash!))
+  (set-box-impersonator-hash!)
+  (record-writer (type-descriptor future*)
+    (lambda (r p wr)
+    (fprintf p "#<future>"))))
+
+
+  
