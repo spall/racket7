@@ -101,7 +101,6 @@ racket currently does in C.
     ;; 2. mark future as blocked. os it doesnt get scheduled again
     ;; 3. then just run engines continuously until done when touched
     (define f (current-future))
-    (fprintf (current-error-port) "Trying to block\n")
     (when (and f (not (future*-blocked? f)))
 	  (fprintf (current-error-port) "Blocking because future that is not blocked yet\n")
 	  (lock-acquire (future*-lock f))

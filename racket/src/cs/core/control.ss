@@ -669,7 +669,7 @@
                              (loop rmc))))]))])))
 
 (define (metacontinuation-frame-clear-cache mf)
-  (metacontinuation-frame-merge mf #f))
+  (metacontinuation-frame-merge mf #f)) ;; hmm
 
 ;; Get/cache a converted list of marks for a metacontinuation
 (define (metacontinuation-marks mc)
@@ -826,8 +826,9 @@
 
 (define/who continuation-mark-set-first
   (case-lambda
-    [(marks key) (continuation-mark-set-first marks key #f)]
+    [(marks key) (block)(continuation-mark-set-first marks key #f)]
     [(marks key none-v)
+    (block)
      (continuation-mark-set-first marks key none-v
                                   ;; Treat `break-enabled-key` and `parameterization-key`, specially
                                   ;; so that things like `current-break-parameterization` work without
@@ -837,6 +838,7 @@
                                       the-root-continuation-prompt-tag
                                       the-default-continuation-prompt-tag))]
     [(marks key none-v prompt-tag)
+     (block)
      (check who continuation-mark-set? :or-false marks)
      (check who continuation-prompt-tag? prompt-tag)
      (let ([prompt-tag (strip-impersonator prompt-tag)])
