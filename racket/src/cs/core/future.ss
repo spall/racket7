@@ -13,7 +13,8 @@
 
 (define-record-type (future* make-future future?)
     (fields id would-be? (mutable thunk) (mutable engine) 
-	    (mutable result) (mutable done?) cond lock (mutable blocked?)))
+	    (mutable result) (mutable done?) cond lock (mutable blocked?)
+	    (mutable resumed?) (mutable cont) (mutable prompt)))
 ;; future? defined by record.
 
 (define (futures-enabled?)
@@ -32,83 +33,84 @@ racket currently does in C.
  [(threaded?)
 
   (define (thunk-wrapper f thunk)
+    (define p (make-continuation-prompt-tag 'future))
+    (future*-prompt-set! f p)
     (lambda ()
-      (let ([result (thunk)])
-	(lock-acquire (future*-lock f))
-	(future*-result-set! f result)
-	(future*-done?-set! f #t)
-	(condition-signal (future*-cond f))
-	(lock-release (future*-lock f)))))
+      (call-with-continuation-prompt
+       (lambda ()
+	 (let ([result (thunk)])
+	   (lock-acquire (future*-lock f))
+	   (future*-result-set! f result)
+	   (future*-done?-set! f #t)
+	   (condition-signal (future*-cond f))
+	   (lock-release (future*-lock f))))
+       p)))
 
   (define (future thunk)
     (unless (scheduler-running?)
 	    (start-scheduler))
     
-    (let* ([f (make-future (get-next-id) #f (void) (void) (void) #f (make-condition) (make-lock #f) #f)]
+    (let* ([f (make-future (get-next-id) #f (void) (void) (void) 
+			   #f (make-condition) (make-lock #f) #f
+			   #f #f (void))]
 	   [th (thunk-wrapper f thunk)])
       (future*-engine-set! f (make-engine th #f #t))
       (schedule-future f)
       f))
 
   (define (would-be-future thunk)
-    (let* ([f (make-future (get-next-id) #t (void) (void) (void) #f (void) (make-lock #f) #f)]
+    (let* ([f (make-future (get-next-id) #t (void) (void) (void) 
+			   #f (void) (make-lock #f) #f
+			   #f #f (void))]
 	   [th (thunk-wrapper f thunk)])
       (future*-thunk-set! f th)
       f))
 
-  (define (complete ticks args)
-    (void))
-  (define (expire new-eng)
-    (new-eng 500 void complete expire))
-  
   (define (touch f)
     (cond
      [(future*-would-be? f)
       ((future*-thunk f))
       (future*-result f)]
-     [(future*-blocked? f)
-      ((future*-engine f) 500 void complete expire)
+     [(future*-blocked? f) ;; FIX ME
+      (lock-acquire (future*-lock f))
+      (future*-blocked?-set! f #f)
+      (future*-resumed?-set! f #t)
+      (lock-release (future*-lock f))
+      (apply-continuation (future*-cont f) '())
       (future*-result f)]
-     [(future? (current-future)) ;; are we running in a future?
-      (touch-in-future f)]
      [(future*-done? f)
       (future*-result f)]
+     [(future? (current-future)) ;; are we running in a future?
+      (touch f)]
      [(lock-acquire (future*-lock f) #f)
-      (condition-wait (future*-cond f) (future*-lock f)) ;; when this returns we will have result
-      (let ([result (future*-result f)])
-	(lock-release (future*-lock f))
-	result)] ;; acquired 
+      (condition-wait (future*-cond f) (future*-lock f))
+      (lock-release (future*-lock f))
+      (future-awoken f)] ;; acquired 
      [else
       (touch f)])) ;; not acquired. might be writing result now.
 
-  (define (touch-in-future f)
+  (define (future-awoken f)
     (cond
      [(future*-done? f)
       (future*-result f)]
+     [(future*-blocked? f)
+      (lock-acquire (future*-lock f))
+      (future*-blocked?-set! f #f)
+      (future*-resumed?-set! f #t)
+      (lock-release (future*-lock f))
+      (apply-continuation (future*-cont f) '())
+      (future*-result f)]
      [else
-      (touch-in-future f)]))
+      (internal-error 'touch "Awoken in touch but future is neither done nor blocked\n")]))
 
-  ;; we should only ever block once? should never need to block in a touch?
   (define (block)
-    ;; future is runing inside of an engine....
-    ;; block means we don't want to run this future again. until 
-    ;; it is touched
-    ;; when it is touched we finish running it
-    ;; it is still an engine. so can't just run the thunk.
-    ;; 
-    ;; What I think we need to do.
-    ;; 1. call engine-block
-    ;; 2. mark future as blocked. os it doesnt get scheduled again
-    ;; 3. then just run engines continuously until done when touched
     (define f (current-future))
     (when (and f (not (future*-blocked? f)))
-	  (fprintf (current-error-port) "Blocking because future that is not blocked yet\n")
 	  (lock-acquire (future*-lock f))
 	  (future*-blocked?-set! f #t)
 	  (lock-release (future*-lock f))
 	  (engine-block)))
-  ;; if not in a future function just returns. so maybe can just call block
-  ;; without checking if a future is actually running first
+  
   ]
  [else
   ;; not threaded
@@ -123,7 +125,9 @@ racket currently does in C.
     (would-be-future thunk))
 
   (define (would-be-future thunk)
-    (let* ([f (make-future (get-next-id) #t (void) (void) (void) #f (void) (make-lock #f) #f)]
+    (let* ([f (make-future (get-next-id) #t (void) (void) (void) 
+			   #f (void) (make-lock #f) #f
+			   #f #f (void))]
 	   [th (thunk-wrapper f thunk)])
       (future*-thunk-set! f th)
       f))
