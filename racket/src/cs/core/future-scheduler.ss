@@ -96,7 +96,8 @@
 	  (lock-release (worker-lock worker))
 	  (cond
 	   [(steal-work worker)  
-	    (do-work)]
+	    (do-work)
+	    (loop)]
 	   [else  
 	    (wait-for-work worker) ;; doesn't seem to use cpu!
 	    (loop)])]
@@ -122,12 +123,11 @@
 	(lambda ()
 	  (when (future*-blocked? f)
 		(call-with-composable-continuation
-		 (lambda (k)
+		 (lambda (k)		   
 		   (lock-acquire (future*-lock f))
 		   (future*-cont-set! f k)
 		   (lock-release (future*-lock f)))
 		 (future*-prompt f))
-
 		(when (future*-blocked? f) ;; so engine doesn't run more than once.
 		      (condition-signal (future*-cond f)) ;; wake up touch thread (if there is one)
 		      (engine-block)))))
@@ -138,7 +138,7 @@
 	(let ([work (queue-remove! (worker-work-queue worker))])
 	  (current-future work)
 	  (lock-release (worker-lock worker)) ;; release lock
-	  ((future*-engine work) 100 (prefix work) complete (expire work worker)) ;; call engine.
+	  ((future*-engine work) 100000 (prefix work) complete (expire work worker)) ;; call engine.
 	  (current-future #f)))
       
       (loop)))

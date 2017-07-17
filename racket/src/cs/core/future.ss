@@ -71,8 +71,10 @@ racket currently does in C.
      [(future*-would-be? f)
       ((future*-thunk f))
       (future*-result f)]
-     [(future*-blocked? f) ;; FIX ME
-      (lock-acquire (future*-lock f))
+     [(future*-blocked? f)
+     (lock-acquire (future*-lock f)) ;; if we acquire lock. cont is either set or not. 
+     (unless  (future*-cont f) ;; then it hasn't been set yet and need to block
+	      (condition-wait (future*-cond f) (future*-lock f)))
       (future*-blocked?-set! f #f)
       (future*-resumed?-set! f #t)
       (lock-release (future*-lock f))
@@ -93,7 +95,7 @@ racket currently does in C.
     (cond
      [(future*-done? f)
       (future*-result f)]
-     [(future*-blocked? f)
+     [(future*-blocked? f) ;; do I need to check here? I don't believe so. only 2 places signals happen
       (lock-acquire (future*-lock f))
       (future*-blocked?-set! f #f)
       (future*-resumed?-set! f #t)
@@ -101,7 +103,7 @@ racket currently does in C.
       (apply-continuation (future*-cont f) '())
       (future*-result f)]
      [else
-      (internal-error 'touch "Awoken in touch but future is neither done nor blocked\n")]))
+      (error 'touch "Awoken in touch but future is neither done nor blocked\n")]))
 
   (define (block)
     (define f (current-future))
