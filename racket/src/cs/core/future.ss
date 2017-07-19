@@ -107,7 +107,8 @@ racket currently does in C.
 
   (define (block)
     (define f (current-future))
-    (when (and f (not (future*-blocked? f)))
+    (when (and f (not (future*-blocked? f))
+	       (not (future*-resumed? f)))
 	  (lock-acquire (future*-lock f))
 	  (future*-blocked?-set! f #t)
 	  (lock-release (future*-lock f))

@@ -828,7 +828,7 @@
   (case-lambda
     [(marks key) (block)(continuation-mark-set-first marks key #f)]
     [(marks key none-v)
-    (block)
+     (block)
      (continuation-mark-set-first marks key none-v
                                   ;; Treat `break-enabled-key` and `parameterization-key`, specially
                                   ;; so that things like `current-break-parameterization` work without
@@ -1036,6 +1036,7 @@
   (case-lambda
     [() (current-continuation-marks the-default-continuation-prompt-tag)]
     [(tag)
+     (block)
      (check who continuation-prompt-tag? tag)
      (call/cc
       (lambda (k)
