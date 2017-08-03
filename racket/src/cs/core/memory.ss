@@ -1,4 +1,6 @@
 
+(define collect-garbage-pending? (chez:make-parameter #f))
+
 (define (set-collect-handler!)
   (collect-request-handler (lambda () (collect/report #f))))
 
@@ -40,17 +42,22 @@
   (case-lambda
    [() (collect-garbage 'major)]
    [(request)
-    (void)
-    #;(case request
-      [(incremental) (void)]
-      [(minor)
-       (collect/report 0)]
-      [(major)
-       (collect/report (collect-maximum-generation))]
-      [else
-       (raise-argument-error 'collect-garbage
-                             "(or/c 'major 'minor 'incremental)"
-                             request)])]))
+    (cond
+     [(= 0 (get-thread-id))
+      (halt-workers)
+      (case request
+	[(incremental) (void)]
+	[(minor)
+	 (collect/report 0)]
+	[(major)
+	 (collect/report (collect-maximum-generation))]
+	[else
+	 (raise-argument-error 'collect-garbage
+			       "(or/c 'major 'minor 'incremental)"
+			       request)])
+      (resume-workers)]
+     [else
+      (collect-garbage-pending? #t)])]))
 
 (define current-memory-use
   (case-lambda

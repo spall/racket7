@@ -7,9 +7,6 @@
  [(threaded?)
   (define global-scheduler #f)
   
-  (define (scheduler-running?)
-    (not (not global-scheduler)))
-  
   (define-record-type (worker make-worker worker?)
     (fields id (mutable real-thread) (mutable work-queue) (mutable idle?) lock cond (mutable die?)))
   
@@ -17,22 +14,44 @@
     (fields (mutable workers) lock))
   
   (define THREAD-COUNT 3)
-  (define (start-scheduler)
-    (cond
-     [global-scheduler
-      (void)]
-     [else
-      (set! global-scheduler (make-scheduler #f (make-lock #f)))
-      (let ([workers (create-workers)])
-	(scheduler-workers-set! global-scheduler workers)
-	(start-workers workers))]))
-  
-  (define (kill-scheduler)
+
+  (define (maybe-start-scheduler)
+    (unless global-scheduler
+	    (set! global-scheduler (make-scheduler #f (make-lock #f)))
+	    (let ([workers (create-workers)])
+	      (scheduler-workers-set! global-scheduler workers)
+	      (start-workers workers))))
+
+  ;; Note: If multiple threads are waiting on the same condition using DIFFERENT mutexes
+  ;; and condition-broadcast is called, only ONE thread will be awoken.  
+  ;; This information seems to be omitted from the chez docs.
+  ;; All threads must use same mutex to wait in order to be awoken.
+  (define halt-cond (make-condition))
+  (define halt-mutex (make-mutex)) 
+
+  ;; external facing
+  (define (halt-workers)
+    (maybe-start-scheduler)
     (for-each (lambda (worker)
 		(lock-acquire (worker-lock worker))
 		(worker-die?-set! worker #t)
 		(lock-release (worker-lock worker)))
-	      (scheduler-workers global-scheduler)))
+	      (scheduler-workers global-scheduler))
+    (let f ()
+      (when (> (active-threads) 1) ;; block until all workers have halted
+	    (f))))
+  
+  ;; external facing
+  (define (resume-workers)
+    ;; this should never be called before halt-workers
+    (maybe-start-scheduler)
+    (for-each (lambda (w)
+		(lock-acquire (worker-lock w)) ;; can't acquire these locks duh.
+		(worker-die?-set! w #f)
+		(lock-release (worker-lock w)))
+	      (scheduler-workers global-scheduler))
+    (condition-broadcast halt-cond))
+	      
   
   (define (create-workers)
     (map (lambda (id-1)
@@ -45,16 +64,14 @@
        (worker-real-thread-set! worker (fork-thread (worker-scheduler-func worker))))
      workers))
   
+  ;; external facing
   (define (schedule-future f)
-    (cond
-     [(not global-scheduler)
-      (error 'schedule-future "scheduler not running\n")]
-     [else
-      (let ([worker (pick-worker)])
-	(lock-acquire (worker-lock worker))
-	(queue-add! (worker-work-queue worker) f)
-	(condition-signal (worker-cond worker))
-	(lock-release (worker-lock worker)))]))
+    (maybe-start-scheduler)
+    (let ([ worker (pick-worker)])
+      (lock-acquire (worker-lock worker))
+      (queue-add! (worker-work-queue worker) f)
+      (condition-signal (worker-cond worker))
+      (lock-release (worker-lock worker))))
 
   (define (pick-worker)
     (define workers (scheduler-workers global-scheduler))
@@ -90,20 +107,21 @@
       (define (loop)
 	(lock-acquire (worker-lock worker)) ;; block
 	(cond
-	 [(worker-die? worker) ;; worker was killed
-	  (lock-release (worker-lock worker))]
+	 [(worker-die? worker) ;; worker was halted.
+	  (lock-release (worker-lock worker))
+	  (mutex-acquire halt-mutex)
+	  (condition-wait halt-cond halt-mutex)
+	  (mutex-release halt-mutex)]
 	 [(queue-empty? (worker-work-queue worker)) ;; have lock. no work
 	  (lock-release (worker-lock worker))
 	  (cond
 	   [(steal-work worker)  
-	    (do-work)
-	    (loop)]
+	    (do-work)]
 	   [else  
-	    (wait-for-work worker) ;; doesn't seem to use cpu!
-	    (loop)])]
+	    (wait-for-work worker)])]
 	 [else  
-	  (do-work)
-	  (loop)]))
+	  (do-work)])
+	(loop))
       
       (define (complete ticks args)
 	(void))
@@ -136,6 +154,9 @@
       ;; need to have lock here.
       (define (do-work)
 	(let ([work (queue-remove! (worker-work-queue worker))])
+	#;  (fprintf (current-error-port) "Worker ~a has ~a jobs\n" 
+		   (worker-id worker)
+		   (queue-length (worker-work-queue worker)))
 	  (current-future work)
 	  (lock-release (worker-lock worker)) ;; release lock
 	  ((future*-engine work) 100000 (prefix work) complete (expire work worker)) ;; call engine.

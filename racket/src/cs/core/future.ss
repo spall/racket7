@@ -47,9 +47,6 @@ racket currently does in C.
        p)))
 
   (define (future thunk)
-    (unless (scheduler-running?)
-	    (start-scheduler))
-    
     (let* ([f (make-future (get-next-id) #f (void) (void) (void) 
 			   #f (make-condition) (make-lock #f) #f
 			   #f #f (void))]

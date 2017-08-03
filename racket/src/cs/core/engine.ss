@@ -68,6 +68,11 @@
 (define (engine-block)
   (assert-not-in-uninterrupted)
   (timer-interrupt-handler void)
+  ;; check if garbage needs to be collected.
+  (when (and (= 0 (get-thread-id))
+	     (collect-garbage-pending?))
+	(collect-garbage-pending? #f)
+	(collect-garbage))
   (let ([es (current-engine-state)])
     (unless es
       (error 'engine-block "not currently running an engine"))

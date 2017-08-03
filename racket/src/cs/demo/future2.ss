@@ -24,7 +24,6 @@
 
 (printf "Touched all futures\n")
 	    
-(kill-scheduler)
 
 (define end-time (current-time 'time-duration))
 (let ([ss (* 1000000000 (time-second start-time))]
