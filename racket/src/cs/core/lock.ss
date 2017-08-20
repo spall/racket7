@@ -9,6 +9,45 @@
   (set! scheduler-lock-acquire acquire)
   (set! scheduler-lock-release release))
 
+(define-record-type (f-cond f-make-condition f-condition?)
+  (fields (mutable blocked-futures) lock))
+
+;; already checked type
+(define (f-condition-wait c)
+  (define cf (current-future))
+  (when (and cf (future*-cond-wait? cf)) ;; fatal error
+	(error 'f-condition-wait "future is already waiting on condition\n"))
+  (lock-acquire (f-cond-lock c))
+  (queue-add! (f-cond-blocked-futures c) cf) ;;; WHAT to do for a racket thread?  call (current-thread)?
+  (lock-release (f-cond-lock c))
+  (future*-cond-wait?-set! cf #t) ;; do we need to acquire future's lock?
+  (engine-block))
+
+(define (f-condition-signal c)
+  (lock-acquire (f-cond-lock c)) ;; probably stuck ehre?
+  (unless (queue-empty? (f-cond-blocked-futures c)) ;; not empty
+	  (let ([f (queue-remove! (f-cond-blocked-futures c))])
+	    (future*-cond-wait?-set! f #f)))
+  (lock-release (f-cond-lock c)))
+	    
+;; what about racing to wait and signal?
+(define (f-condition-broadcast c) 
+  (lock-acquire (f-cond-lock c))
+  (let loop ()
+    (unless (queue-empty? (f-cond-blocked-futures c)) ;; not empty
+	    (let ([f (queue-remove! (f-cond-blocked-futures c))])
+	      (future*-cond-wait?-set! f #f)
+	      (loop))))
+  (lock-release (f-cond-lock c)))
+
+;; What do I need condition to do?
+
+;; Problem: Future might need to use real AND fake condition
+;; fake condition COULD contain a real condition. But how would we know when to ignore real
+;; condition and when to use it?
+;; Could have flag that signalled when to use real or fake condition. BUT then this changes the API
+;; which is maybe not a problem. since this code isn't going to be exported to the user.
+
 (meta-cond
  [(guard (x [#t #t]) (eval 'make-mutex) #f)
   ;; Using a Chez Scheme build without thread support,
@@ -37,7 +76,18 @@
 
   (define (lock-release lock)
     (when lock
-      (scheduler-lock-release lock)))]
+      (scheduler-lock-release lock)))
+
+  (define (make-condition) 
+    (void))
+  ;; todo
+  (define (condition-wait c m)
+    (void))
+  (define (condition-signal c)
+    (void))
+  (define (condition-broadcast c)
+    (void))
+  ]
  [else
   ;; Using a Chez Scheme build with thread support; make hash-table
   ;; access thread-safe at that level for `eq?`- and `eqv?`-based
@@ -55,23 +105,139 @@
   (define (create-mcs-spinlock) (make-mcs-spinlock #f #f))
   |#
 
+  (define-record-type (f-lock make-f-lock f-lock?)
+    (fields ftptr (mutable owner)))
+  
+  ;; create own atomic region. TODO
+
+  (define (cf-id)
+    (if (not (current-future))
+	#f
+	(future*-id (current-future))))
+  
+    ;; An implementation I imagine would be more efficient is for
+    ;; this function to engine-block and have the scheduler check
+    ;; when the lock is available and then reschedule when that 
+    ;; occurs rather than being occasionally scheduled by the scheduler and 
+    ;; possibly only looping during that time
+    ;; AND a lock with a queue so futures are more fairly given the lock. 
+    ;; harder to implement (impossible?)  with current atomic operations
+  (define (f-lock-acquire lock block?)
+    (define rlock (f-lock-ftptr lock))
+    (cond
+     [(eq? (ftype-ref uptr () rlock) 1)
+      (start-atomic)
+      (fprintf (current-error-port) "future ~a Trying to acquire lock\n" (cf-id))
+      (cond
+       [(ftype-locked-decr! uptr () rlock) ;; acquired lock
+	(fprintf (current-error-port) "Got lock\n")
+	(f-lock-owner-set! lock (current-future))
+	(end-atomic)
+	#t]
+       [(not block?)
+	(ftype-locked-incr! uptr () rlock) ;; undo our increment
+	(end-atomic)
+	#f]
+       [else ;; failed to acquire lock
+	(ftype-locked-incr! uptr () rlock)
+	(end-atomic)
+	(f-lock-acquire lock block?)])]  ;; try again
+     [(not block?)
+      #f]
+     [else ;; lock is already held so dont try to acquire
+      (f-lock-acquire lock block?)]))
+
+  (define (f-lock-release lock)
+    ;; should this code error if one is true but not the other? below
+    (when (and (eq? (current-future) (f-lock-owner lock)))
+	      ; (> (ftype-ref uptr () (f-lock-ftptr lock)) -1))
+	  (start-atomic)
+	  (f-lock-owner-set! lock #t)
+	  (ftype-locked-incr! uptr () (f-lock-ftptr lock))
+	  (end-atomic)))
+
   (define (make-lock for-kind)
-    (if (eq? for-kind 'equal?)
-        (make-scheduler-lock)
-        (make-mutex)))
+    (cond
+     [(eq? for-kind 'equal?)
+        (make-scheduler-lock)]
+     [(eq? for-kind 'future)
+      (make-f-lock (let ([l (make-ftype-pointer 
+			     uptr ;; check that this is correct
+			     (foreign-alloc (ftype-sizeof uptr)))])
+		     (ftype-init-lock! uptr () l) ; set to 0
+		     (ftype-locked-incr! uptr () l) ; set to 1
+		     l) #t)]
+     [else
+      (make-mutex)]))
 
   (define lock-acquire
     (case-lambda
      [(lock)
-      (if (mutex? lock)
-	  (mutex-acquire lock)
-	  (scheduler-lock-acquire lock))]
+      (cond
+       [(mutex? lock)
+	(mutex-acquire lock)]
+       [(f-lock? lock)
+	(f-lock-acquire lock #t)]
+       [else
+	(scheduler-lock-acquire lock)])]
      [(lock block?)
-      (if (mutex? lock)
-	  (mutex-acquire lock block?)
-	  (scheduler-lock-acquire lock))]))
+      (cond
+       [(mutex? lock)
+	  (mutex-acquire lock block?)]
+       [(f-lock? lock)
+	(f-lock-acquire lock block?)]
+       [else
+	(scheduler-lock-acquire lock)])]))
   
   (define (lock-release lock)
-    (if (mutex? lock)
-        (mutex-release lock)
-        (scheduler-lock-release lock)))])
+    (cond
+     [(mutex? lock)
+      (mutex-release lock)]
+     [(f-lock? lock)
+      (f-lock-release lock)]
+     [else
+      (scheduler-lock-release lock)]))
+
+  ;; Conditions for futures
+  (define (make-condition)
+    (f-make-condition (make-queue) (make-lock 'future)))
+
+  ;; In the case of a future, ignores the 
+  (define (condition-wait c m)
+    (unless (f-condition? c)
+	    (error 'condition-wait "Expected a condition\n"))
+    ;; TODO: check if future owns this lock. can do if we made the locks :)
+    (lock-release m) 
+    (f-condition-wait c)
+    (lock-acquire m))
+
+  ;; regular condition-signal says it will wakeup some thread. So we will do the same
+  ;; no guarantee about who will be awoken
+  ;; will attempt to wake a real thread if there are no futures waiting.
+  (define (condition-signal c)
+    (unless (f-condition? c)
+	    (error 'condition-signal "Expected a condition\n"))
+    (f-condition-signal c))
+  
+  ;; first wake up any futures. Then wake up any threads.
+  (define (condition-broadcast c)
+    (unless (f-condition? c)
+	    (error 'condition-broadcast "Expected a condition\n"))
+    (f-condition-broadcast c))
+
+  ;; Want to verify that when condition-wait is called by a worker. that it does the REAL
+  ;; condition wait
+  
+
+  ;; need conditions for threads.
+
+  ;; extend interface racket gets from chez. provide a mutable vector with 1 element?
+  ;; extend engine-block to take an optional argument.  passes that argument to an expire procedure
+  ;; argument would give the thread scheduler a mutable variable. and scheduler owuldn't run
+  ;; thread again until that mutable variable was true  or false.
+  ;; just created a backchannel
+  
+  ;; touch passes mutable variable over this backchannel.
+  ;; 
+
+])

@@ -36,7 +36,7 @@
   
   (define (create-workers)
     (map (lambda (id-1)
-	   (make-worker (+ 1 id-1) #f (make-queue) #t (make-lock #f) (make-condition) #f))
+	   (make-worker (+ 1 id-1) #f (make-queue) #t (make-lock #f) (chez:make-condition) #f))
 	 (iota THREAD-COUNT)))
   
   (define (start-workers workers)
@@ -53,7 +53,7 @@
       (let ([worker (pick-worker)])
 	(lock-acquire (worker-lock worker))
 	(queue-add! (worker-work-queue worker) f)
-	(condition-signal (worker-cond worker))
+	(chez:condition-signal (worker-cond worker))
 	(lock-release (worker-lock worker)))]))
 
   (define (pick-worker)
@@ -79,7 +79,7 @@
        [(not (queue-empty? (worker-work-queue worker))) ;; got work in meantime
 	(void)]
        [(lock-acquire m #f) ;; cannot acquire lock while worker is being given work.
-	(condition-wait (worker-cond worker) m)
+	(chez:condition-wait (worker-cond worker) m)
 	(lock-release m)]
        [else ;; try to get lock again.
 	(try)])))
@@ -111,13 +111,17 @@
       (define (expire future worker)
 	(lambda (new-eng)
 	  (future*-engine-set! future new-eng)
-	  (cond
+	  (cond  ;; what about condition wait here?
+	   [(current-atomic)
+	    ((future*-engine future) 100000 (prefix future) complete (expire future worker))]
 	   [(future*-resumed? future) ;; run to completion
-	    ((future*-engine future) 100 void complete (expire future worker))]
+	    ((future*-engine future) 1000 void complete (expire future worker))]
 	   [(not (future*-cont future)) ;; don't want to reschedule future with a saved continuation
 	    (lock-acquire (worker-lock worker))
 	    (queue-add! (worker-work-queue worker) future)
-	    (lock-release (worker-lock worker))])))
+	    (lock-release (worker-lock worker))]
+	   [else 
+	    (condition-signal (future*-cond future))])))
 
       (define (prefix f)
 	(lambda ()
@@ -126,20 +130,23 @@
 		 (lambda (k)		   
 		   (lock-acquire (future*-lock f))
 		   (future*-cont-set! f k)
-		   (lock-release (future*-lock f)))
-		 (future*-prompt f))
-		(when (future*-blocked? f) ;; so engine doesn't run more than once.
-		      (condition-signal (future*-cond f)) ;; wake up touch thread (if there is one)
-		      (engine-block)))))
+		   (lock-release (future*-lock f))
+		   (engine-block))
+		 (future*-prompt f)))))
 
       
       ;; need to have lock here.
       (define (do-work)
 	(let ([work (queue-remove! (worker-work-queue worker))])
-	  (current-future work)
-	  (lock-release (worker-lock worker)) ;; release lock
-	  ((future*-engine work) 100000 (prefix work) complete (expire work worker)) ;; call engine.
-	  (current-future #f)))
+	  (cond
+	   [(future*-cond-wait? work)
+	    (queue-add! (worker-work-queue worker) work)
+	    (lock-release (worker-lock worker))] ;; put back on queue
+	   [else
+	    (current-future work)
+	    (lock-release (worker-lock worker)) ;; release lock
+	    ((future*-engine work) 100000 (prefix work) complete (expire work worker)) ;; call engine.
+	    (current-future #f)])))
       
       (loop)))
 

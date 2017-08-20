@@ -655,6 +655,7 @@
   (include "core/future.ss")	
   (include "core/queue.ss")
   (include "core/future-scheduler.ss")
+  (include "core/atomic.ss")
   
   (set-no-locate-source!)
   (set-base-exception-handler!)

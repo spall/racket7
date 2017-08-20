@@ -34,7 +34,10 @@
                            random random-seed
                            box? unbox set-box!)
                    [make-parameter chez:make-parameter]
-
+		   [make-condition chez:make-condition]
+		   [condition-wait chez:condition-wait]
+		   [condition-signal chez:condition-signal]
+		   [condition-broadcast chez:condition-broadcast]
                    [void chez:void]
                    [date-second chez:date-second]
                    [date-minute chez:date-minute]

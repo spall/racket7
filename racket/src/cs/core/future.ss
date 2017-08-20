@@ -12,9 +12,12 @@
     id))
 
 (define-record-type (future* make-future future?)
-    (fields id would-be? (mutable thunk) (mutable engine) 
-	    (mutable result) (mutable done?) cond lock (mutable blocked?)
-	    (mutable resumed?) (mutable cont) (mutable prompt)))
+  (fields id would-be? cond lock 
+	  (mutable thunk) (mutable engine) (mutable cont) (mutable prompt) (mutable result)
+	  (mutable done?) (mutable blocked?) (mutable resumed?) (mutable cond-wait?)))
+
+;; TODO: add cond wait flag
+;; are all of these flags still necessary? feeling a bit crowded
 ;; future? defined by record.
 
 (define (futures-enabled?)
@@ -33,8 +36,6 @@ racket currently does in C.
  [(threaded?)
 
   (define (thunk-wrapper f thunk)
-    (define p (make-continuation-prompt-tag 'future))
-    (future*-prompt-set! f p)
     (lambda ()
       (call-with-continuation-prompt
        (lambda ()
@@ -44,46 +45,44 @@ racket currently does in C.
 	   (future*-done?-set! f #t)
 	   (condition-signal (future*-cond f))
 	   (lock-release (future*-lock f))))
-       p)))
+       (future*-prompt f))))
 
   (define (future thunk)
     (unless (scheduler-running?)
 	    (start-scheduler))
     
-    (let* ([f (make-future (get-next-id) #f (void) (void) (void) 
-			   #f (make-condition) (make-lock #f) #f
-			   #f #f (void))]
+    (let* ([f (make-future (get-next-id) #f (make-condition) (make-lock 'future)
+			   #f #f #f (make-continuation-prompt-tag 'future) (void)
+			   #f #f #f #f)]
 	   [th (thunk-wrapper f thunk)])
       (future*-engine-set! f (make-engine th #f #t))
       (schedule-future f)
       f))
 
   (define (would-be-future thunk)
-    (let* ([f (make-future (get-next-id) #t (void) (void) (void) 
-			   #f (void) (make-lock #f) #f
-			   #f #f (void))]
+    (let* ([f (make-future (get-next-id) #t (make-condition) (make-lock 'future)
+			   #f #f #f (make-continuation-prompt-tag 'future) (void)
+			   #f #f #f #f)]
 	   [th (thunk-wrapper f thunk)])
       (future*-thunk-set! f th)
       f))
 
   (define (touch f)
     (cond
+     [(future*-done? f)
+      (future*-result f)]
      [(future*-would-be? f)
       ((future*-thunk f))
       (future*-result f)]
      [(future*-blocked? f)
-     (lock-acquire (future*-lock f)) ;; if we acquire lock. cont is either set or not. 
-     (unless  (future*-cont f) ;; then it hasn't been set yet and need to block
-	      (condition-wait (future*-cond f) (future*-lock f)))
+      (lock-acquire (future*-lock f)) ;; if we acquire lock. cont is either set or not. 
+      (unless  (future*-cont f) ;; then it hasn't been set yet and need to block
+	       (condition-wait (future*-cond f) (future*-lock f)))
       (future*-blocked?-set! f #f)
       (future*-resumed?-set! f #t)
       (lock-release (future*-lock f))
       (apply-continuation (future*-cont f) '())
       (future*-result f)]
-     [(future*-done? f)
-      (future*-result f)]
-     [(future? (current-future)) ;; are we running in a future?
-      (touch f)]
      [(lock-acquire (future*-lock f) #f)
       (condition-wait (future*-cond f) (future*-lock f))
       (lock-release (future*-lock f))
@@ -107,8 +106,7 @@ racket currently does in C.
 
   (define (block)
     (define f (current-future))
-    (when (and f (not (future*-blocked? f))
-	       (not (future*-resumed? f)))
+    (when (and f (not (future*-blocked? f)) (not (future*-resumed? f)))
 	  (lock-acquire (future*-lock f))
 	  (future*-blocked?-set! f #t)
 	  (lock-release (future*-lock f))
@@ -128,9 +126,9 @@ racket currently does in C.
     (would-be-future thunk))
 
   (define (would-be-future thunk)
-    (let* ([f (make-future (get-next-id) #t (void) (void) (void) 
-			   #f (void) (make-lock #f) #f
-			   #f #f (void))]
+    (let* ([f (make-future (get-next-id) #t (make-condition) (make-lock 'equal?)
+					#f #f #f (void) (void)
+					#f #f #f #f)]
 	   [th (thunk-wrapper f thunk)])
       (future*-thunk-set! f th)
       f))
