@@ -585,6 +585,14 @@
 	  current-future
 	  would-be-future
 	  processor-count
+
+
+	  ;; atomics
+	  atomically
+	  start-atomic
+	  end-atomic
+	  set-end-atomic-callback!
+	  current-atomic
 	  )	  
   (import (chezpart)
 	  (rename (only (chezscheme) sleep)

@@ -9,22 +9,38 @@
   (set! scheduler-lock-acquire acquire)
   (set! scheduler-lock-release release))
 
+
+(define make-scheduler-condition (lambda () #f))
+(define scheduler-condition-wait (lambda (c) (void)))
+(define scheduler-condition-signal (lambda (c) (void)))
+(define scheduler-condition-broadcast (lambda (c) (void)))
+
+(define (set-scheduler-condition-callbacks! make wait signal broadcast)
+  (set! make-scheduler-condition make)
+  (set! scheduler-condition-wait wait)
+  (set! scheduler-condition-signal signal)
+  (set! scheduler-condition-broadcast broadcast))
+
 (define-record-type (f-cond f-make-condition f-condition?)
-  (fields (mutable blocked-futures) lock))
+  (fields scond (mutable blocked-futures) lock))
 
 ;; already checked type
-(define (f-condition-wait c)
+(define (f-condition-wait c m)
   (define cf (current-future))
+  (unless (own-lock? m)
+	  (error 'f-condition-wait "future does not hold mutex\n"))
   (when (and cf (future*-cond-wait? cf)) ;; fatal error
 	(error 'f-condition-wait "future is already waiting on condition\n"))
   (lock-acquire (f-cond-lock c))
-  (queue-add! (f-cond-blocked-futures c) cf) ;;; WHAT to do for a racket thread?  call (current-thread)?
+  (queue-add! (f-cond-blocked-futures c) cf)
   (lock-release (f-cond-lock c))
-  (future*-cond-wait?-set! cf #t) ;; do we need to acquire future's lock?
-  (engine-block))
+  (lock-relase m) 
+  (future*-cond-wait?-set! cf #t) ;; do we need to acquire future's lock? m could have been future's lock
+  (engine-block)
+  (lock-acquire m))
 
 (define (f-condition-signal c)
-  (lock-acquire (f-cond-lock c)) ;; probably stuck ehre?
+  (lock-acquire (f-cond-lock c))
   (unless (queue-empty? (f-cond-blocked-futures c)) ;; not empty
 	  (let ([f (queue-remove! (f-cond-blocked-futures c))])
 	    (future*-cond-wait?-set! f #f)))
@@ -38,7 +54,7 @@
 	    (let ([f (queue-remove! (f-cond-blocked-futures c))])
 	      (future*-cond-wait?-set! f #f)
 	      (loop))))
-  (lock-release (f-cond-lock c)))
+  (lock-release (f-cond-lock c))) 
 
 ;; What do I need condition to do?
 
@@ -78,15 +94,14 @@
     (when lock
       (scheduler-lock-release lock)))
 
-  (define (make-condition) 
-    (void))
-  ;; todo
+  (define make-condition make-scheduler-condition)
   (define (condition-wait c m)
-    (void))
-  (define (condition-signal c)
-    (void))
-  (define (condition-broadcast c)
-    (void))
+    (lock-release m)
+    (scheduler-condition wait c)
+    (lock-acquire m))
+  
+  (define condition-signal scheduler-condition-signal)
+  (define condition-broadcast scheduler-condition-broadcast)
   ]
  [else
   ;; Using a Chez Scheme build with thread support; make hash-table
@@ -198,18 +213,47 @@
      [else
       (scheduler-lock-release lock)]))
 
+  ;; returns true if current-future owns lock
+  (define (own-lock? lock)
+    (eq? (current-future) (f-lock-owner lock)))
+
   ;; Conditions for futures
   (define (make-condition)
-    (f-make-condition (make-queue) (make-lock 'future)))
+    (f-make-condition (make-scheduler-condition) (make-queue) (make-lock 'future)))
 
-  ;; In the case of a future, ignores the 
+  ;; how to synchronize threads and futures together??????
+  ;; they need to share locks. 
+
+  ;; Have a future lock, which will be acquired by both a racket thread and a future. 
+  ;; Scenario. 
+  ;; future wants to write result to future. 
+  ;; a racket thread wants to touch the future and therefore needs to acquire the future's lock
+  ;; How do we let thread see that future has lock and vice-versa?
+
+  ;; When future acquires lock, it uses atomic decrement to attempt to acquire lock
+  ;; The lock is in a busy-loop which can jsut be descheduled by future scheduler which means
+  ;; future acquiring lock does not block real thread. GOOD
+  ;; also lock stores which future holds it. 
+
+  ;; What we want a racket thread to do when it acquires a lock at this level is NOT block
+  ;; the racket thraed scheduler. So just not block real thread like above.
+  ;; So, if a rthread calls lock-acquire it needs to acquire the SAME lock as the future
+  ;; so that either the rthread or the future holds the lock. 
+  ;; so thread can call the same code as the future, but cannot use the atomics created
+  ;; at this level. because they don't control the rthread scheduler. 
+
+
   (define (condition-wait c m)
     (unless (f-condition? c)
 	    (error 'condition-wait "Expected a condition\n"))
     ;; TODO: check if future owns this lock. can do if we made the locks :)
-    (lock-release m) 
-    (f-condition-wait c)
-    (lock-acquire m))
+    (cond
+     [(not (current-future)) ;; thread wait. this condition check doesnt work
+      (lock-release m)
+      (scheduler-condition-wait c)
+      (lock-acquire m)]
+     [else
+      (f-condition-wait c m)]))
 
   ;; regular condition-signal says it will wakeup some thread. So we will do the same
   ;; no guarantee about who will be awoken
@@ -217,17 +261,20 @@
   (define (condition-signal c)
     (unless (f-condition? c)
 	    (error 'condition-signal "Expected a condition\n"))
-    (f-condition-signal c))
+    ;; how to know when to signal to a thread?
+    (cond
+     [(queue-empty? (f-cond-blocked-futures c))
+      (scheduler-condition-signal c)]
+     [else
+      (f-condition-signal c)]))
   
   ;; first wake up any futures. Then wake up any threads.
   (define (condition-broadcast c)
     (unless (f-condition? c)
 	    (error 'condition-broadcast "Expected a condition\n"))
+    (scheduler-condition-broadcast c)
     (f-condition-broadcast c))
 
-  ;; Want to verify that when condition-wait is called by a worker. that it does the REAL
-  ;; condition wait
-  
 
   ;; need conditions for threads.
 
@@ -241,3 +288,8 @@
   ;; 
 
 ])
+
+
+;; WHY can't a futures continuation be executed twice?
+
+

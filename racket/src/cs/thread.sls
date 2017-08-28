@@ -49,4 +49,11 @@
 
   (set-scheduler-lock-callbacks! (lambda () (1/make-semaphore 1))
                                  1/semaphore-wait
-                                 1/semaphore-post))
+                                 1/semaphore-post)
+  
+  (set-scheduler-condition-callbacks! (lambda () (1/make-semaphore 1))
+  				      1/semaphore-wait
+				      1/semaphore-post
+				      1/semaphore-post))
+
+				 

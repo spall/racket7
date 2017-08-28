@@ -15,4 +15,9 @@
    fsemaphore-try-wait?
    fsemaphore-count
    reset-future-logs-for-tracing!
-   mark-future-trace-end!))
+   mark-future-trace-end!
+   current-atomic
+   start-atomic
+   end-atomic
+   end-atomic-callback
+   set-end-atomic-callback!))

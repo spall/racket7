@@ -77,7 +77,9 @@ racket currently does in C.
      [(future*-blocked? f)
       (lock-acquire (future*-lock f)) ;; if we acquire lock. cont is either set or not. 
       (unless  (future*-cont f) ;; then it hasn't been set yet and need to block
-	       (condition-wait (future*-cond f) (future*-lock f)))
+	       (lock-release (future*-lock f))
+	       (condition-wait (future*-cond f) (future*-lock f))
+	       (lock-acquire (future*-lock f)))
       (future*-blocked?-set! f #f)
       (future*-resumed?-set! f #t)
       (lock-release (future*-lock f))

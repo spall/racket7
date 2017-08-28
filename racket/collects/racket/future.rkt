@@ -16,7 +16,13 @@
           would-be-future
           futures-enabled?
           for/async
-          for*/async)
+          for*/async
+          
+          current-atomic
+          start-atomic
+          end-atomic
+          end-atomic-callback
+          set-end-atomic-callback!)
 
 ;; Note: order of touches not guaranteed.
 
