@@ -150,8 +150,8 @@
 (define (future-block)
   (define f (current-future))
   (when (and f (not (future*-blocked? f)) (not (future*-resumed? f)))
-    (with-lock ((future*-lock f) f)
-      (set-future*-blocked?! f #t))
+    ;(with-lock ((future*-lock f) f)
+      (set-future*-blocked?! f #t)
     (engine-block)))
 
 ;; called from chez layer.
@@ -230,14 +230,14 @@
 
 ;; ------------------------------------- future scheduler ----------------------------------------
 
-(define THREAD-COUNT 2)
-(define TICKS 1000000000)
+(define THREAD-COUNT 1)
+(define TICKS 1000000000000)
 
 (define global-scheduler #f)
 (define (scheduler-running?)
   (not (not global-scheduler)))
 
-(struct worker (id lock mutex cond
+(struct worker (id lock mutex cond [count #:mutable]
                    [queue #:mutable] [idle? #:mutable] 
                    [pthread #:mutable #:auto] [die? #:mutable #:auto]
                    [halt? #:mutable #:auto])
@@ -264,13 +264,22 @@
 
 (define halt-cond (chez:make-condition))
 (define halt-mutex (chez:make-mutex))
+(define halt-count (box 0))
+(define (halt-count+1)
+  (define hc (unbox halt-count))
+  (unless (box-cas! halt-count hc (+ 1 hc))
+    (halt-count+1)))
 
 ;; ditto
 ;; only called by main thread for gc?
 (define (halt-workers)
   (when global-scheduler
+    (let g ()
+      (when (< (chez:active-threads) (+ 1 (unbox halt-count)))
+        (g)))
+    (set-box! halt-count 0)
     (for-each (lambda (w)
-    	       ; (with-lock ((worker-lock w) (get-caller))
+    	        ;(with-lock ((worker-lock w) (get-caller))
                 (set-worker-halt?! w #t))
 	      (scheduler-workers global-scheduler))
     (let f ()
@@ -281,10 +290,10 @@
 (define (resume-workers)
   (when global-scheduler
     (for-each (lambda (w)
-                (with-lock ((worker-lock w) (get-caller))
-                  (chez:mutex-acquire (worker-mutex w))
-                  (set-worker-halt?! w #f)
-                  (chez:mutex-release (worker-mutex w))))
+                ;(with-lock ((worker-lock w) (get-caller))
+                  ;(chez:mutex-acquire (worker-mutex w))
+                  (set-worker-halt?! w #f))
+                  ;(chez:mutex-release (worker-mutex w))))
               (scheduler-workers global-scheduler))
     (chez:condition-broadcast halt-cond)))
 
@@ -292,7 +301,7 @@
   (let loop ([id 1])
     (cond
       [(< id (+ 1 THREAD-COUNT))
-       (cons (worker id (make-lock) (chez:make-mutex) (chez:make-condition) (make-cwsdeque) #t)
+       (cons (worker id (make-lock) (chez:make-mutex) (chez:make-condition) 0 (make-cwsdeque) #t)
              (loop (+ id 1)))]
       [else
        '()])))
@@ -319,11 +328,12 @@
      (push-bottom (scheduler-queue global-scheduler) f)
      ;; need to wake up at least 1 worker, so they will run this future.
      ;; easy to just wake up all of them.
-     (define w (pick-worker))
-     (when w
-       (chez:mutex-acquire (worker-mutex w))
-       (chez:condition-signal (worker-cond w))
-       (chez:mutex-release (worker-mutex w)))]
+     ;(define w (pick-worker))
+     (for-each (lambda (w)
+                 (chez:mutex-acquire (worker-mutex w))
+                 (chez:condition-signal (worker-cond w))
+                 (chez:mutex-release (worker-mutex w)))
+               (scheduler-workers global-scheduler))]
     [else ;; worker. so add to it's own queue
      (define w (car (list-tail (scheduler-workers global-scheduler) (- id 1))))
      (push-bottom (worker-queue w) f)]))
@@ -344,6 +354,7 @@
 ;; workers are the only ones who give themselves work now. so, only need to check if main thread
 ;; has potential work
 (define (wait-for-work w)
+  (printf "In wait for work; worker ~a ran ~a futures since beginning of time\n" (worker-id w) (worker-count w))
   (let try ()
     (define work (steal (scheduler-queue global-scheduler)))
     (cond
@@ -368,6 +379,7 @@
          (void)]
 	[(worker-halt? worker) ;; worker is halting for gc
 	 (chez:mutex-acquire halt-mutex)
+         (halt-count+1)
 	 (chez:condition-wait halt-cond halt-mutex)
 	 (chez:mutex-release halt-mutex)
 	 (loop)]
@@ -416,6 +428,8 @@
 
     (define (do-work work)
       (unless (future*-cond-wait? work)
+        ;(printf "Worker ~a running future ~a\n" (worker-id worker) (future*-id work))
+        (set-worker-count! worker (+ 1 (worker-count worker)))
         (current-future work)
         ((future*-engine work) TICKS (prefix work) complete (expire work worker)) ;; call engine.
         (current-future #f)))
