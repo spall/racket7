@@ -100,7 +100,7 @@
      (future*-prompt f))))
 
 (define/who (future thunk)
-  (check who (procedure-arity-includes/c 0) thunk)
+  ;(check who (procedure-arity-includes/c 0) thunk)
   (cond
     [(not (futures-enabled?))
      (would-be-future thunk)]
@@ -117,7 +117,7 @@
     f))
 
 (define/who (touch f)
-  (check who future*? f)
+  ;(check who future*? f)
   (cond
     [(future*-done? f)
      (future*-result f)]
@@ -173,14 +173,12 @@
 ;; what is C implementation doing so that its fibonacci is so much faster?
 
 (define (wait-future f m)
-  (with-lock ((future*-lock f) f)
-    (set-future*-cond-wait?! f #t))
+  (set-future*-cond-wait?! f #t)
   (lock-release m (get-caller))
   (engine-block))
 
 (define (awaken-future f)
-  (with-lock ((future*-lock f) (get-caller))
-    (set-future*-cond-wait?! f #f))
+  (set-future*-cond-wait?! f #f)
   (schedule-future f))
 
 ;; --------------------------- conditions ------------------------------------
@@ -230,7 +228,7 @@
 
 ;; ------------------------------------- future scheduler ----------------------------------------
 
-(define THREAD-COUNT 1)
+(define THREAD-COUNT 2)
 (define TICKS 1000000000000)
 
 (define global-scheduler #f)
@@ -328,12 +326,12 @@
      (push-bottom (scheduler-queue global-scheduler) f)
      ;; need to wake up at least 1 worker, so they will run this future.
      ;; easy to just wake up all of them.
-     ;(define w (pick-worker))
-     (for-each (lambda (w)
-                 (chez:mutex-acquire (worker-mutex w))
-                 (chez:condition-signal (worker-cond w))
-                 (chez:mutex-release (worker-mutex w)))
-               (scheduler-workers global-scheduler))]
+     (define w (pick-worker))
+     ;(for-each (lambda (w)
+     (when w
+       (chez:mutex-acquire (worker-mutex w))
+       (chez:condition-signal (worker-cond w))
+       (chez:mutex-release (worker-mutex w)))]
     [else ;; worker. so add to it's own queue
      (define w (car (list-tail (scheduler-workers global-scheduler) (- id 1))))
      (push-bottom (worker-queue w) f)]))
@@ -354,13 +352,14 @@
 ;; workers are the only ones who give themselves work now. so, only need to check if main thread
 ;; has potential work
 (define (wait-for-work w)
-  (printf "In wait for work; worker ~a ran ~a futures since beginning of time\n" (worker-id w) (worker-count w))
+  ;(printf "In wait for work; worker ~a ran ~a futures since beginning of time\n" (worker-id w) (worker-count w))
   (let try ()
     (define work (steal (scheduler-queue global-scheduler)))
     (cond
       [(equal? work 'Empty) ;; no work. go to sleep
        (chez:mutex-acquire (worker-mutex w))
        (set-worker-idle?! w #t)
+       (printf "Worker ~a going to sleep, received Abort ~a times\n" (worker-id w) (worker-count w))
        (chez:condition-wait (worker-cond w) (worker-mutex w))
        (set-worker-idle?! w #f)
        (chez:mutex-release (worker-mutex w))
@@ -393,7 +392,8 @@
                          work
                          (wait-for-work worker)))]
            [else
-            (do-work work)]) ;; infinite loop in some cases....
+            ;(printf "Worker ~a running work from own queue\n" (worker-id worker))
+            (do-work work)])
          (set-worker-idle?! worker #f)
          (loop)]))
     
@@ -405,15 +405,20 @@
         (set-future*-engine! future new-eng)
         (cond
           [(positive? (current-atomic))
+           ;(printf "Future ~a expired\n" (future*-id future))
            ((future*-engine future) TICKS (prefix future) complete (expire future worker))]
           [(future*-resumed? future) ;; run to completion
+           ;(printf "Future ~a expired\n" (future*-id future))
            ((future*-engine future) TICKS void complete (expire future worker))]
           [(future*-cond-wait? future)
+           ;(printf "Future ~a expired for cond-wait\n" (future*-id future))
            (void)]
           [(not (future*-cont future)) ;; don't want to reschedule future with a saved continuation
+           ;(printf "Future ~a expired\n" (future*-id future))
            ((future*-engine future) TICKS (prefix future) complete (expire future worker))]
           [else
            (with-lock ((future*-lock future) (get-caller))
+             ;(printf "Future ~a expired captured continuation\n" (future*-id future))
              (future:condition-signal (future*-cond future)))])))
     
     (define (prefix f)
@@ -429,7 +434,7 @@
     (define (do-work work)
       (unless (future*-cond-wait? work)
         ;(printf "Worker ~a running future ~a\n" (worker-id worker) (future*-id work))
-        (set-worker-count! worker (+ 1 (worker-count worker)))
+        ;(set-worker-count! worker (+ 1 (worker-count worker)))
         (current-future work)
         ((future*-engine work) TICKS (prefix work) complete (expire work worker)) ;; call engine.
         (current-future #f)))
@@ -453,9 +458,11 @@
     [else
      (or (and (equal? mtwork 'Abort)
               (let try ()
+                (set-worker-count! worker (+ 1 (worker-count worker)))
                 (define work (steal (scheduler-queue global-scheduler)))
                 (cond
                   [(equal? work 'Abort)
+                   (set-worker-count! worker (+ 1 (worker-count worker)))
                    (try)]
                   [(not (equal? work 'Empty))
                    work]
