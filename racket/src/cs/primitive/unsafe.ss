@@ -138,8 +138,10 @@
    
    unsafe-struct-ref
    unsafe-struct-set!
+   unsafe-struct-cas!
    unsafe-struct*-ref
    unsafe-struct*-set!
+   unsafe-struct*-cas!
    
    unsafe-immutable-hash-iterate-key+value
    unsafe-immutable-hash-iterate-pair

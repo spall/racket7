@@ -60,4 +60,5 @@
         [active-pthreads chez:active-threads]
         [collect-garbage-pending-major? chez:collect-garbage-pending-major?]
         [collect-garbage-pending-minor? chez:collect-garbage-pending-minor?]
-        threaded?)
+        threaded?
+        [unsafe-struct-cas! chez:unsafe-struct-cas!])

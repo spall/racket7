@@ -8,7 +8,8 @@
          "../common/queue.rkt"
          "../common/deque.rkt"
          "thread.rkt"
-         "lock.rkt")
+         "lock.rkt"
+         racket/unsafe/ops)
 
 (provide futures-enabled?
          processor-count
@@ -59,25 +60,72 @@
 (define futures-enabled? threaded?)
 
 (struct future* (id cond lock prompt
-                    would-be? [thunk #:mutable] [engine #:mutable] 
-                    [cont #:mutable] [result #:mutable] [done? #:mutable]  
-                    [blocked? #:mutable][resumed? #:mutable] 
-                    [cond-wait? #:mutable]))
+                    [flags #:mutable] [engine-or-thunk #:mutable] 
+                    [cont #:mutable] [result #:mutable]))
+;; authentic.?
+
+(define (set-future*-cond-wait?! f b)
+  (set-future*-flags!
+   f
+   (if b
+       (unsafe-fxior (future*-flags f) 1)
+       (unsafe-fxand (future*-flags f) 30)))) ;; 11110 = 16 + 8 + 4 + 2 = 30
+
+(define (future*-cond-wait? f)
+  (unsafe-fx= (unsafe-fxand (future*-flags f) 1) 1))
+
+(define (set-future*-resumed?! f b)
+  (set-future*-flags!
+   f
+   (if b
+       (unsafe-fxior (future*-flags f) 2)     ;; 00010
+       (unsafe-fxand (future*-flags f) 29)))) ;; 11101 = 16 + 8 + 4 + 1 = 29
+
+(define (future*-resumed? f)
+  (unsafe-fx= (unsafe-fxand (future*-flags f) 2) 2))
+
+(define (set-future*-blocked?! f b)
+  (set-future*-flags!
+   f
+   (if b
+       (unsafe-fxior (future*-flags f) 4)      ;; 00100
+       (unsafe-fxand (future*-flags f) 28))))  ;; 11011 = 16 + 8 + 2 + 2 = 28
+
+(define (future*-blocked? f)
+  (unsafe-fx= (unsafe-fxand (future*-flags f) 4) 4)) ;; 00100
+
+(define (set-future*-done?! f b)
+  (set-future*-flags!
+   f
+   (if b
+       (unsafe-fxior (future*-flags f) 8)         ;; 01000
+       (unsafe-fxand (future*-flags f) 23))))     ;; 10111 = 16 + 4 + 2 + 1 = 23
+
+(define (future*-done? f)
+  (unsafe-fx= (unsafe-fxand (future*-flags f) 8) 8))
+
+(define (set-future*-would-be?! f b)
+  (set-future*-flags!
+   f
+   (if b
+       (unsafe-fxior (future*-flags f) 16)
+       (unsafe-fxand (future*-flags f) 15))))    ;; 01111 = 8 + 4 + 2 + 1 = 15
+
+(define (future*-would-be? f)
+  (unsafe-fx= (unsafe-fxand (future*-flags f) 16) 16))
 
 (define (create-future would-be-future?)
   (future* (get-next-id) ;; id
            (future:make-condition) ;; cond
            (make-lock) ;; lock
            (make-continuation-prompt-tag 'future) ;; prompt
-           would-be-future? ;; would-be?
-           #f   ;; thunk
-           #f   ;; engine
+           (if would-be-future? #;flags ;; would-be? done? blocked? resumed? cond-wait?
+               16 ;; 10000
+               0) ;; 00000 
+           #f   ;; engine-or-thunk
            #f   ;; cont
            #f   ;; result
-           #f   ;; done?
-           #f   ;; blocked?
-           #f   ;; resumed?
-           #f)) ;; cond-wait?
+           ))
 
 (define future? future*?)
 
@@ -106,15 +154,20 @@
      (would-be-future thunk)]
     [else
      (let ([f (create-future #f)])
-       (set-future*-engine! f (make-engine (thunk-wrapper f thunk) #f #t))
+       (set-future*-engine-or-thunk! f ;(thunk-wrapper f thunk)
+                                     (make-engine (thunk-wrapper f thunk) #f #t))
        (schedule-future f)
        f)]))
 
 (define/who (would-be-future thunk)
   (check who (procedure-arity-includes/c 0) thunk)
   (let ([f (create-future #t)])
-    (set-future*-thunk! f (thunk-wrapper f thunk))
+    (set-future*-engine-or-thunk! f (thunk-wrapper f thunk))
     f))
+
+;;(define
+;; delay, force, promise?
+;;;;;;;;;;;;;;;;;;;;;;;
 
 (define/who (touch f)
   ;(check who future*? f)
@@ -122,7 +175,7 @@
     [(future*-done? f)
      (future*-result f)]
     [(future*-would-be? f)
-     ((future*-thunk f))
+     ((future*-engine-or-thunk f))
      (future*-result f)]
     [(lock-acquire (future*-lock f) (get-caller) #f) ;; got lock
      (when (or (and (not (future*-blocked? f)) (not (future*-done? f)))
@@ -151,7 +204,7 @@
   (define f (current-future))
   (when (and f (not (future*-blocked? f)) (not (future*-resumed? f)))
     ;(with-lock ((future*-lock f) f)
-      (set-future*-blocked?! f #t)
+    (set-future*-blocked?! f #t)
     (engine-block)))
 
 ;; called from chez layer.
@@ -231,34 +284,59 @@
 (define THREAD-COUNT 2)
 (define TICKS 1000000000000)
 
-(define global-scheduler #f)
-(define (scheduler-running?)
-  (not (not global-scheduler)))
+(define main-queue (make-cwsdeque))
+(define future-workers #f)
 
 (struct worker (id lock mutex cond [count #:mutable]
-                   [queue #:mutable] [idle? #:mutable] 
-                   [pthread #:mutable #:auto] [die? #:mutable #:auto]
-                   [halt? #:mutable #:auto])
-  #:auto-value #f)
+                   [queue #:mutable] [pthread #:mutable]
+                   [flags #:mutable]))
 
-(struct scheduler (queue workers) #:mutable) ;; queue is owned by main thread.
+(define (set-worker-idle?! w b)
+  (set-worker-flags!
+   w
+   (if b
+       (unsafe-fxior (worker-flags w) 1)
+       (unsafe-fxand (worker-flags w) 6))))  ;; 110 = 4 + 2 
+
+(define (worker-idle? w)
+  (unsafe-fx= (unsafe-fxand (worker-flags w) 1) 1))
+
+(define (set-worker-die?! w b)
+  (set-worker-flags!
+   w
+   (if b
+       (unsafe-fxior (worker-flags w) 2)
+       (unsafe-fxand (worker-flags w) 5)))) ;; 101 = 4 + 1
+
+(define (worker-die? w)
+  (unsafe-fx= (unsafe-fxand (worker-flags w) 2) 2))
+
+(define (set-worker-halt?! w b)
+  (set-worker-flags!
+   w
+   (if b
+       (unsafe-fxior (worker-flags w) 4)
+       (unsafe-fxand (worker-flags 2) 3)))) ;; 011 = 3
+
+(define (worker-halt? w)
+  (unsafe-fx= (unsafe-fxand (worker-flags w) 4) 4))
 
 ;; I think this atomically is sufficient to guarantee scheduler is only created once.
-(define (maybe-start-scheduler)
+(define (maybe-start-workers)
   (atomically
-   (unless global-scheduler
-     (set! global-scheduler (scheduler (make-cwsdeque) #f))
+   (unless future-workers
      (let ([workers (create-workers)])
-       (set-scheduler-workers! global-scheduler workers)
+       (set! future-workers workers)
        (start-workers workers)))))
 
 ;; why do we even need to acquire lock when setting die?! to true?
 (define (kill-scheduler)
-  (when global-scheduler 
-    (for-each (lambda (w)
-                ;(with-lock ((worker-lock w) (get-caller))
-                (set-worker-die?! w #t))
-              (scheduler-workers global-scheduler))))
+  (when future-workers
+    (let loop ([in 1])
+      (when (< in (+ 1 THREAD-COUNT))
+        (let ([w (vector-ref future-workers in)])
+          (set-worker-die?! w #t))
+        (loop (+ 1 in))))))
 
 (define halt-cond (chez:make-condition))
 (define halt-mutex (chez:make-mutex))
@@ -271,90 +349,80 @@
 ;; ditto
 ;; only called by main thread for gc?
 (define (halt-workers)
-  (when global-scheduler
+  (when future-workers
     (let g ()
       (when (< (chez:active-threads) (+ 1 (unbox halt-count)))
         (g)))
     (set-box! halt-count 0)
-    (for-each (lambda (w)
-    	        ;(with-lock ((worker-lock w) (get-caller))
-                (set-worker-halt?! w #t))
-	      (scheduler-workers global-scheduler))
+    (for ([w (in-vector future-workers 1)])
+      (set-worker-halt?! w #t))
     (let f ()
       (when (> (chez:active-threads) 1) ;; block until all workers have halted
         (f)))))
 
 ;; only called by main thread for gc?
 (define (resume-workers)
-  (when global-scheduler
-    (for-each (lambda (w)
-                ;(with-lock ((worker-lock w) (get-caller))
-                  ;(chez:mutex-acquire (worker-mutex w))
-                  (set-worker-halt?! w #f))
-                  ;(chez:mutex-release (worker-mutex w))))
-              (scheduler-workers global-scheduler))
+  (when future-workers
+    (for ([w (in-vector future-workers 1)])
+      (set-worker-halt?! w #f))
     (chez:condition-broadcast halt-cond)))
 
 (define (create-workers)
+  (define worker-vec (make-vector (+ 1 THREAD-COUNT) #f))
   (let loop ([id 1])
-    (cond
-      [(< id (+ 1 THREAD-COUNT))
-       (cons (worker id (make-lock) (chez:make-mutex) (chez:make-condition) 0 (make-cwsdeque) #t)
-             (loop (+ id 1)))]
-      [else
-       '()])))
+    (when (< id (+ 1 THREAD-COUNT))
+      (vector-set! worker-vec id (worker id (make-lock) (chez:make-mutex) (chez:make-condition) 0 (make-cwsdeque) #f 1))
+      (loop (+ 1 id))))
+  worker-vec)
 
 ;; When a new thread is forked it inherits the values of thread parameters from its creator
 ;; So, if current-atomic is set for the main thread and then new threads are forked, those new
 ;; threads current-atomic will be set and then never unset because they will not run code that
 ;; unsets it.
 (define (start-workers workers)
-  (for-each (lambda (w)
-              (set-worker-pthread! w (fork-pthread (lambda ()
-                                                     (current-atomic 0)
-                                                     (current-thread #f)
-                                                     (current-engine-state #f)
-                                                     (current-future #f)
-                                                     ((worker-scheduler-func w))))))
-            workers))
+  (let loop ([in 1])
+    (when (< in (+ 1 THREAD-COUNT))
+      (let ([w (vector-ref workers in)])
+        (set-worker-pthread! w (fork-pthread (lambda ()
+                                               (current-atomic 0)
+                                               (current-thread #f)
+                                               (current-engine-state #f)
+                                               (current-future #f)
+                                               ((worker-scheduler-func w))))))
+      (loop (+ 1 in)))))
 
 (define (schedule-future f)
   (define id (get-pthread-id))
   (cond
-    [(= 0 id) ;; main thread
-     (maybe-start-scheduler)
-     (push-bottom (scheduler-queue global-scheduler) f)
-     ;; need to wake up at least 1 worker, so they will run this future.
-     ;; easy to just wake up all of them.
+    [(= 0 id)
+     (maybe-start-workers)
+     (push-bottom main-queue f)
      (define w (pick-worker))
-     ;(for-each (lambda (w)
      (when w
        (chez:mutex-acquire (worker-mutex w))
        (chez:condition-signal (worker-cond w))
        (chez:mutex-release (worker-mutex w)))]
-    [else ;; worker. so add to it's own queue
-     (define w (car (list-tail (scheduler-workers global-scheduler) (- id 1))))
-     (push-bottom (worker-queue w) f)]))
+    [else
+     (push-bottom (worker-queue (vector-ref future-workers id)) f)]))
 
 ;; pick idle worker.
 (define (pick-worker)
-  (define workers (scheduler-workers global-scheduler))
-  (let loop ([w (car workers)]
-             [ws (cdr workers)])
-    (cond
-      [(worker-idle? w) 
-       w]
-      [(null? ws) ;; no workers are idle
-       #f]
-      [else
-       (loop (car ws) (cdr ws))])))
+  (let loop ([in 1])
+    (if (< in (+ 1 THREAD-COUNT))
+        (let ([w (vector-ref future-workers in)])
+          (cond
+            [(worker-idle? w)
+             w]
+            [else
+             (loop (+ 1 in))]))
+        #f)))
 
 ;; workers are the only ones who give themselves work now. so, only need to check if main thread
 ;; has potential work
 (define (wait-for-work w)
   ;(printf "In wait for work; worker ~a ran ~a futures since beginning of time\n" (worker-id w) (worker-count w))
   (let try ()
-    (define work (steal (scheduler-queue global-scheduler)))
+    (define work (steal main-queue))
     (cond
       [(equal? work 'Empty) ;; no work. go to sleep
        (chez:mutex-acquire (worker-mutex w))
@@ -402,20 +470,20 @@
     
     (define (expire future worker)
       (lambda (new-eng)
-        (set-future*-engine! future new-eng)
+        (set-future*-engine-or-thunk! future new-eng)
         (cond
           [(positive? (current-atomic))
            ;(printf "Future ~a expired\n" (future*-id future))
-           ((future*-engine future) TICKS (prefix future) complete (expire future worker))]
+           ((future*-engine-or-thunk future) TICKS (prefix future) complete (expire future worker))]
           [(future*-resumed? future) ;; run to completion
            ;(printf "Future ~a expired\n" (future*-id future))
-           ((future*-engine future) TICKS void complete (expire future worker))]
+           ((future*-engine-or-thunk future) TICKS void complete (expire future worker))]
           [(future*-cond-wait? future)
            ;(printf "Future ~a expired for cond-wait\n" (future*-id future))
            (void)]
           [(not (future*-cont future)) ;; don't want to reschedule future with a saved continuation
            ;(printf "Future ~a expired\n" (future*-id future))
-           ((future*-engine future) TICKS (prefix future) complete (expire future worker))]
+           ((future*-engine-or-thunk future) TICKS (prefix future) complete (expire future worker))]
           [else
            (with-lock ((future*-lock future) (get-caller))
              ;(printf "Future ~a expired captured continuation\n" (future*-id future))
@@ -436,7 +504,7 @@
         ;(printf "Worker ~a running future ~a\n" (worker-id worker) (future*-id work))
         ;(set-worker-count! worker (+ 1 (worker-count worker)))
         (current-future work)
-        ((future*-engine work) TICKS (prefix work) complete (expire work worker)) ;; call engine.
+        ((future*-engine-or-thunk work) TICKS (prefix work) complete (expire work worker)) ;; call engine.
         (current-future #f)))
     
     (loop)))
@@ -444,14 +512,13 @@
 ;; worker is attempting to steal work from peers or main thread
 (define (steal-work worker)
   (define (pick-rand-worker)
-    (define rand (random THREAD-COUNT))
-    (define rand-worker (car (list-tail workers rand)))
+    (define rand (+ 1 (random THREAD-COUNT)))
+    (define rand-worker (vector-ref future-workers rand))
     (if (eq? worker rand-worker)
         (pick-rand-worker)
         rand-worker))
   (define RETRY 2)
-  (define workers (scheduler-workers global-scheduler))
-  (define mtwork (steal (scheduler-queue global-scheduler)))
+  (define mtwork (steal main-queue))
   (cond
     [(not (or (equal? mtwork 'Empty) (equal? mtwork 'Abort)))
      mtwork]
@@ -459,7 +526,7 @@
      (or (and (equal? mtwork 'Abort)
               (let try ()
                 (set-worker-count! worker (+ 1 (worker-count worker)))
-                (define work (steal (scheduler-queue global-scheduler)))
+                (define work (steal main-queue))
                 (cond
                   [(equal? work 'Abort)
                    (set-worker-count! worker (+ 1 (worker-count worker)))

@@ -922,6 +922,9 @@
 (define (unsafe-struct*-set! s i v)
   (#3%vector-set! s i v))
 
+(define (unsafe-struct*-cas! s i old new)
+  (#3%vector-cas! s i old new))
+
 (define (unsafe-struct-ref s i)
   (if (impersonator? s)
       (let loop ([rtd* (record-rtd (impersonator-val s))])
@@ -939,6 +942,11 @@
               (impersonate-set! (record-field-mutator rtd* i) rtd* pos i s v)
               (loop (record-type-parent rtd*)))))
       (unsafe-struct*-set! s i v)))
+
+;; todo unsafe-struct-cas!
+(define (unsafe-struct-cas! s i old new)
+  (unsafe-struct*-cas! s i old new))
+
 
 (define-values (prop:equal+hash equal+hash? equal+hash-ref)
   (make-struct-type-property 'equal+hash

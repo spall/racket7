@@ -596,8 +596,10 @@
 
           unsafe-struct-ref
           unsafe-struct-set!
+          unsafe-struct-cas!
           unsafe-struct*-ref
           unsafe-struct*-set!
+          unsafe-struct*-cas!
 
           unsafe-s16vector-ref
           unsafe-s16vector-set!

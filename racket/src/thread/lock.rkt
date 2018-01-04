@@ -1,6 +1,7 @@
 #lang racket/base
 
-(require "internal-error.rkt")
+(require "internal-error.rkt"
+         "engine.rkt")
 
 (provide with-lock
          make-lock
@@ -18,17 +19,16 @@
 (struct future-lock* (box owner))
 
 (define (lock-owner lock)
-  (unbox (future-lock*-owner lock)))
+  (future-lock*-owner lock))
 
 (define (make-lock)
-  (future-lock* (box 0) (box #f)))
+  (future-lock* 0 #f))
 
 (define (lock-acquire lock caller [block? #t])
-  (define box (future-lock*-box lock))
   (let loop ()
     (cond
-      [(and (= 0 (unbox box)) (box-cas! box 0 1)) ;; got lock
-       (unless (box-cas! (future-lock*-owner lock) #f caller)
+      [(and (= 0 (future-lock*-box lock)) (chez:unsafe-struct-cas! lock 0 0 1)) ;; got lock
+       (unless (chez:unsafe-struct-cas! lock 1 #f caller)
          (internal-error "Lock already has owner."))
        #t]
       [block?
@@ -37,16 +37,16 @@
        #f])))
 
 (define (lock-release lock caller)
-  (when (eq? caller (unbox (future-lock*-owner lock)))
-    (unless (box-cas! (future-lock*-owner lock) caller #f)
+  (when (eq? caller (future-lock*-owner lock))
+    (unless (chez:unsafe-struct-cas! lock 1 caller #f)
       (internal-error "Failed to reset owner\n"))
-    (unless (box-cas! (future-lock*-box lock) 1 0)
+    (unless (chez:unsafe-struct-cas! lock 0 1 0)
       (internal-error "Lock release failed\n"))))
 
 (define (own-lock? lock caller)
-  (and (eq? caller (unbox (future-lock*-owner lock)))
+  (and (eq? caller (future-lock*-owner lock))
        (begin0
            #t
-         (unless (= 1 (unbox (future-lock*-box lock)))
+         (unless (= 1 (future-lock*-box lock))
            (internal-error "Caller 'owns' lock but lock is free.")))))
 

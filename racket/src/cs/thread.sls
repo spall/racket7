@@ -74,6 +74,7 @@
                      'collect-garbage-pending-major? collect-garbage-pending-major?
                      'collect-garbage-pending-minor? collect-garbage-pending-minor?
                      'threaded? rumble:threaded?
+                     'unsafe-struct-cas! unsafe-struct-cas!
                      )]
       [else #f]))
 
