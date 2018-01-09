@@ -205,6 +205,7 @@
   (when (and f (not (future*-blocked? f)) (not (future*-resumed? f)))
     ;(with-lock ((future*-lock f) f)
     (set-future*-blocked?! f #t)
+    ;(printf "Engine block 1; current future is ~a\n" f)
     (engine-block)))
 
 ;; called from chez layer.
@@ -228,6 +229,7 @@
 (define (wait-future f m)
   (set-future*-cond-wait?! f #t)
   (lock-release m (get-caller))
+  ;(printf "engine block 2\n")
   (engine-block))
 
 (define (awaken-future f)
@@ -286,6 +288,7 @@
 
 (define main-queue (make-cwsdeque))
 (define future-workers #f)
+(define workers-counts #f)
 
 (struct worker (id lock mutex cond [count #:mutable]
                    [queue #:mutable] [pthread #:mutable]
@@ -369,6 +372,7 @@
 
 (define (create-workers)
   (define worker-vec (make-vector (+ 1 THREAD-COUNT) #f))
+  (set! workers-counts (make-vector (+ 1 THREAD-COUNT) 0))
   (let loop ([id 1])
     (when (< id (+ 1 THREAD-COUNT))
       (vector-set! worker-vec id (worker id (make-lock) (chez:make-mutex) (chez:make-condition) 0 (make-cwsdeque) #f 1))
@@ -391,18 +395,31 @@
                                                ((worker-scheduler-func w))))))
       (loop (+ 1 in)))))
 
+(define work1? #f)
+(define work2? #f)
+
 (define (schedule-future f)
   (define id (get-pthread-id))
   (cond
     [(= 0 id)
      (maybe-start-workers)
      (push-bottom main-queue f)
+     ;(printf "put future on queue\n")
      (define w (pick-worker))
      (when w
+       ;(printf "waking up worker ~a\n" (worker-id w))
        (chez:mutex-acquire (worker-mutex w))
        (chez:condition-signal (worker-cond w))
        (chez:mutex-release (worker-mutex w)))]
     [else
+    #;(cond
+      [(and (= id 1) (not work1?))
+       ;(printf "Worker ~a adding to queue\n" id)
+       (set! work1? #t)]
+      [(and (= id 2) (not work2?))
+       ;(printf "Worker ~a adding to queue\n" id)
+       (set! work2? #t)])
+       
      (push-bottom (worker-queue (vector-ref future-workers id)) f)]))
 
 ;; pick idle worker.
@@ -415,34 +432,39 @@
              w]
             [else
              (loop (+ 1 in))]))
-        #f)))
+        (vector-ref future-workers 1))))
 
 ;; workers are the only ones who give themselves work now. so, only need to check if main thread
-;; has potential work
+;; or peer has potential work
 (define (wait-for-work w)
-  ;(printf "In wait for work; worker ~a ran ~a futures since beginning of time\n" (worker-id w) (worker-count w))
+  ;(printf "In wait for work;\n")
   (let try ()
+    (chez:mutex-acquire (worker-mutex w))
     (define work (steal main-queue))
     (cond
       [(equal? work 'Empty) ;; no work. go to sleep
-       (chez:mutex-acquire (worker-mutex w))
        (set-worker-idle?! w #t)
-       (printf "Worker ~a going to sleep, received Abort ~a times\n" (worker-id w) (worker-count w))
+       ;(printf "Worker ~a going to sleep; did ~a work\n" (worker-id w) (vector-ref workers-counts (worker-id w)))
        (chez:condition-wait (worker-cond w) (worker-mutex w))
        (set-worker-idle?! w #f)
+       ;(printf "worker awoken\n")
        (chez:mutex-release (worker-mutex w))
        (try)] ;; awoken so must be work on main thread.
       [(equal? work 'Abort) ;; lost race so try again
-       (try)] ;; should i add a timeout?
+      (chez:mutex-release (worker-mutex w))
+       (try)]
       [else
+      (chez:mutex-release (worker-mutex w))
        work])))
 
 (define (worker-scheduler-func worker)
   (lambda ()
     
     (define (loop)
+      ;(printf "worker looping\n")
       (cond
         [(worker-die? worker) ;; worker was killed
+	;(printf "worker dying\n")
          (void)]
 	[(worker-halt? worker) ;; worker is halting for gc
 	 (chez:mutex-acquire halt-mutex)
@@ -455,14 +477,17 @@
          (cond
            [(equal? work 'Empty)
             ;; try to steal
-            (set! work (steal-work worker))
-            (do-work (if work
-                         work
-                         (wait-for-work worker)))]
+	    ;(printf "worker going to steal\n")
+            (set! work (steal-work worker 0))  
+	    
+            (do-work (if (eq? work 'FAIL)
+                         (wait-for-work worker)
+                         work))]
            [else
             ;(printf "Worker ~a running work from own queue\n" (worker-id worker))
             (do-work work)])
          (set-worker-idle?! worker #f)
+	 
          (loop)]))
     
     (define (complete ticks args)
@@ -496,6 +521,7 @@
              (lambda (k)
                (with-lock ((future*-lock f) (current-future))
                  (set-future*-cont! f k))
+		 ;(printf "engine block 3\n")
                (engine-block))
              (future*-prompt f)))))
 
@@ -503,68 +529,59 @@
       (unless (future*-cond-wait? work)
         ;(printf "Worker ~a running future ~a\n" (worker-id worker) (future*-id work))
         ;(set-worker-count! worker (+ 1 (worker-count worker)))
+	(vector-set! workers-counts (worker-id worker) (+ 1 (vector-ref workers-counts (worker-id worker))))
         (current-future work)
         ((future*-engine-or-thunk work) TICKS (prefix work) complete (expire work worker)) ;; call engine.
         (current-future #f)))
     
     (loop)))
 
-;; worker is attempting to steal work from peers or main thread
-(define (steal-work worker)
-  (define (pick-rand-worker)
-    (define rand (+ 1 (random THREAD-COUNT)))
-    (define rand-worker (vector-ref future-workers rand))
-    (if (eq? worker rand-worker)
-        (pick-rand-worker)
-        rand-worker))
-  (define RETRY 2)
-  (define mtwork (steal main-queue))
-  (cond
-    [(not (or (equal? mtwork 'Empty) (equal? mtwork 'Abort)))
-     mtwork]
-    [else
-     (or (and (equal? mtwork 'Abort)
-              (let try ()
-                (set-worker-count! worker (+ 1 (worker-count worker)))
-                (define work (steal main-queue))
-                (cond
-                  [(equal? work 'Abort)
-                   (set-worker-count! worker (+ 1 (worker-count worker)))
-                   (try)]
-                  [(not (equal? work 'Empty))
-                   work]
-                  [else
-                   #f])))
-         (let try ([victim (pick-rand-worker)]
-                   [attempt 0])
-           (cond
-             [(< attempt (- THREAD-COUNT 1))
-              (define work (steal (worker-queue victim)))
-              (cond
-                [(equal? work 'Empty)
-                 (try (pick-rand-worker)
-                      (+ 1 attempt))]
-                [(equal? work 'Abort)
-                 (let inner ([a 0])
-                   (cond
-                     [(< a RETRY)
-                      (define work (steal (worker-queue victim)))
-                      (cond
-                        [(equal? work 'Empty)
-                         (try (pick-rand-worker)
-                              (+ 1 attempt))]
-                        [(equal? work 'Abort)
-                         (inner (+ 1 a))]
-                        [else
-                         work])]
-                     [else
-                      (try (pick-rand-worker)
-                           (+ 1 attempt))]))]
-                [else 
-                 work])]
-             [else
-              #f])))]))
 
+;; Code for work stealing
+(define (pick-rand-worker excluded)
+  (define rand (+ 1 (random THREAD-COUNT)))
+  (define rand-worker (vector-ref future-workers rand))
+  (if (eq? excluded rand-worker)
+      (pick-rand-worker excluded)
+      rand-worker))
+
+(define (steal-from-main)
+  (define w (steal main-queue))
+  (cond
+   [(eq? w 'Abort)
+    (steal-from-main)]
+   [else
+    w]))
+
+(define (steal-from-peer excluded)
+  (define peer (pick-rand-worker excluded))
+  (let loop ()
+    (define w (steal (worker-queue peer)))
+    (cond
+     [(eq? w 'Abort)
+      (loop)]
+     [else
+      w])))
+
+(define RETRY-MAX 500)
+
+;; worker is attempting to steal work from peers or main thread
+(define (steal-work worker retry)
+  (define mtwork (steal-from-main))
+  (cond
+   [(>= retry RETRY-MAX)
+    'FAIL]	
+   [(and (eq? mtwork 'Empty) (< THREAD-COUNT 2))
+    'FAIL]
+   [(eq? mtwork 'Empty)
+    (let ([pwork (steal-from-peer worker)])
+      (cond
+       [(eq? pwork 'Empty)
+        (steal-work worker (+ 1 retry))]
+       [else
+        pwork]))]
+   [else
+    mtwork]))
 ;; ----------------------------------------
 
 (define (reset-future-logs-for-tracing!)
