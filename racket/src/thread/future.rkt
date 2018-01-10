@@ -202,11 +202,15 @@
 ;; called from chez layer.
 (define (future-block)
   (define f (current-future))
-  (when (and f (not (future*-blocked? f)) (not (future*-resumed? f)))
+  (cond
+   [(and f (not (future*-blocked? f)) (not (future*-resumed? f)))
     ;(with-lock ((future*-lock f) f)
     (set-future*-blocked?! f #t)
     ;(printf "Engine block 1; current future is ~a\n" f)
-    (engine-block)))
+    (engine-block)]
+   [else
+    (set-box! block-counts (+ 1 (unbox block-counts)))]))
+
 
 ;; called from chez layer.
 ;; this should never be called from outside a future.
@@ -289,6 +293,8 @@
 (define main-queue (make-cwsdeque))
 (define future-workers #f)
 (define workers-counts #f)
+
+(define block-counts #f) ;; block counts for non-future things
 
 (struct worker (id lock mutex cond [count #:mutable]
                    [queue #:mutable] [pthread #:mutable]
@@ -373,6 +379,7 @@
 (define (create-workers)
   (define worker-vec (make-vector (+ 1 THREAD-COUNT) #f))
   (set! workers-counts (make-vector (+ 1 THREAD-COUNT) 0))
+  (set! block-counts (box 0))
   (let loop ([id 1])
     (when (< id (+ 1 THREAD-COUNT))
       (vector-set! worker-vec id (worker id (make-lock) (chez:make-mutex) (chez:make-condition) 0 (make-cwsdeque) #f 1))
@@ -444,7 +451,7 @@
     (cond
       [(equal? work 'Empty) ;; no work. go to sleep
        (set-worker-idle?! w #t)
-       ;(printf "Worker ~a going to sleep; did ~a work\n" (worker-id w) (vector-ref workers-counts (worker-id w)))
+       (printf "Worker ~a going to sleep; did ~a work.  non-future blocks occured ~a times\n" (worker-id w) (vector-ref workers-counts (worker-id w)) (unbox block-counts))
        (chez:condition-wait (worker-cond w) (worker-mutex w))
        (set-worker-idle?! w #f)
        ;(printf "worker awoken\n")
